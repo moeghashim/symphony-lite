@@ -1,0 +1,11 @@
+.git
+.github
+.DS_Store
+node_modules
+tmp
+log
+elixir/_build
+elixir/deps
+elixir/cover
+elixir/.elixir_ls
+elixir/*.ez

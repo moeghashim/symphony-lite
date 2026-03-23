@@ -22,6 +22,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
 skills can make raw Linear GraphQL calls.
+It also injects `sync_workpad`, which lets agents sync a local markdown workpad into the single
+persistent Linear comment without stuffing large comment bodies into the conversation context.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -33,9 +35,10 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
-4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
+4. Optionally copy the `.agents/skills` directory to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
+   - The `linear` skill also uses `sync_workpad` for file-backed workpad updates.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
@@ -63,6 +66,40 @@ mise install
 mise exec -- mix setup
 mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
+```
+
+## Railway
+
+Use Railway with the repository root `Dockerfile`, not a generic buildpack.
+
+Recommended deployment inputs:
+
+- Add a Railway volume mounted at `/data`
+- Set `LINEAR_API_KEY`
+- Set `LINEAR_PROJECT_SLUG`
+- Set `OPENAI_API_KEY`
+- Set `SOURCE_REPO_URL` to the GitHub repo Symphony should clone for each issue
+- If `SOURCE_REPO_URL` is private, set `GITHUB_TOKEN` to a fine-grained GitHub token with read-only access to that repository
+- Use [`WORKFLOW.railway.md`](./WORKFLOW.railway.md) as-is; it reads `LINEAR_PROJECT_SLUG` from the environment
+
+The container entrypoint will:
+
+- fail closed if `LINEAR_API_KEY` is missing
+- read the Linear project slug from `LINEAR_PROJECT_SLUG`
+- log Codex in from `OPENAI_API_KEY` if the container is not already authenticated
+- transparently rewrite `https://github.com/...` clone URLs when `GITHUB_TOKEN` is set, so private repos can be cloned without committing credentials into the workflow
+- start Symphony on Railway's injected `PORT`
+- write workspaces and logs under `/data`
+
+Local smoke test with Docker:
+
+```bash
+docker build -t symphony-railway /Users/moeghashim/symphony
+docker run --rm -p 4100:8080 \
+  -e LINEAR_API_KEY=dummy \
+  -e OPENAI_API_KEY=dummy \
+  -e SOURCE_REPO_URL=https://github.com/openai/symphony \
+  symphony-railway
 ```
 
 ## Configuration
@@ -114,6 +151,7 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- The sample `WORKFLOW.md` in this repo intentionally uses a trusted git-capable posture (`danger-full-access`) because the default Symphony flow clones, branches, commits, and opens PRs inside the issue workspace.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
@@ -165,7 +203,7 @@ The observability UI now runs on a minimal Phoenix stack:
 - `lib/`: application code and Mix tasks
 - `test/`: ExUnit coverage for runtime behavior
 - `WORKFLOW.md`: in-repo workflow contract used by local runs
-- `../.codex/`: repository-local Codex skills and setup helpers
+- `../.agents/skills/`: repository-local skills used by the shipped workflow
 
 ## Testing
 
