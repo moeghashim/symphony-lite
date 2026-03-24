@@ -1,4 +1,4 @@
-FROM elixir:1.19.5-otp-28-bookworm AS build
+FROM elixir:1.19.5-otp-28 AS build
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential git ca-certificates && \
@@ -20,7 +20,7 @@ COPY elixir ./
 RUN mix deps.compile && \
     mix escript.build
 
-FROM elixir:1.19.5-otp-28-bookworm AS runtime
+FROM elixir:1.19.5-otp-28 AS runtime
 
 ARG CODEX_VERSION=0.114.0
 
