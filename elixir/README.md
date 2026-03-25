@@ -152,6 +152,8 @@ Notes:
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - The sample `WORKFLOW.md` in this repo intentionally uses a trusted git-capable posture (`danger-full-access`) because the default Symphony flow clones, branches, commits, and opens PRs inside the issue workspace.
+- Requested workflow posture is not stronger than the host environment. If Codex is launched under a stricter outer sandbox or network policy, the live turn context wins even when `WORKFLOW.md` requests `danger-full-access`.
+- For unattended runs that may execute under `workspace-write` or with shell network disabled, write prompts that prefer connector tools for GitHub and issue-tracker mutations, avoid destructive cleanup such as `rm -rf`/`rm -f`, and switch strategy after a policy-rejected shell command instead of retrying variants.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex

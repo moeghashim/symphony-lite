@@ -66,6 +66,9 @@ Instructions:
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
+4. The workflow requests a trusted Codex posture, but the live turn context is authoritative. If the actual sandbox, approval policy, or network access is stricter than requested here, obey the live turn context instead of assuming `danger-full-access`.
+5. When the live turn context is `workspace-write`, network-disabled, or policy-restricted, do not use shell network Git or shell GitHub commands such as `git clone`, `git fetch`, `git pull`, `git push`, `git ls-remote`, or `gh`. Prefer GitHub/Linear connector tools for remote inspection, publishing, review replies, labels, comments, checks, and merges.
+6. When shell cleanup or destructive commands are policy-rejected, do not retry variants of the same command. Avoid `rm -rf` and `rm -f`; create fresh unique temp directories under writable roots or `/tmp` and leave disposable artifacts in place if cleanup is blocked.
 
 Work only in the provided repository copy. Do not touch any other path.
 
@@ -171,9 +174,9 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 
 1. Identify the PR number from issue links/attachments.
 2. Gather feedback from all channels:
-   - Top-level PR comments (`gh pr view --comments`).
-   - Inline review comments (`gh api repos/<owner>/<repo>/pulls/<pr>/comments`).
-   - Review summaries/states (`gh pr view --json reviews`).
+   - Top-level PR comments (prefer GitHub connector tools; use `gh pr view --comments` only when shell network access is actually available).
+   - Inline review comments (prefer GitHub connector tools; use `gh api repos/<owner>/<repo>/pulls/<pr>/comments` only when shell network access is actually available).
+   - Review summaries/states (prefer GitHub connector tools; use `gh pr view --json reviews` only when shell network access is actually available).
 3. Treat every actionable reviewer comment (human or bot), including inline review comments, as blocking until one of these is true:
    - code/test/docs updated to address it, or
    - explicit, justified pushback reply is posted on that thread.
@@ -186,6 +189,7 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
+- If a shell command is rejected by policy or blocked by the sandbox, treat that command class as unavailable for the run and switch strategies instead of retrying nearby variants.
 - Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
 - If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
   - what is missing,
@@ -214,7 +218,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
-7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
+7.  Before every publish attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then publish via the best available path for the live sandbox (connector tools first when shell network Git is unavailable).
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
     - Ensure the GitHub PR has label `symphony` (add it if missing).
 9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.

@@ -71,6 +71,9 @@ Instructions:
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
+4. The workflow requests a trusted Codex posture, but the live turn context is authoritative. If the actual sandbox, approval policy, or network access is stricter than requested here, obey the live turn context instead of assuming `danger-full-access`.
+5. When the live turn context is `workspace-write`, network-disabled, or policy-restricted, do not use shell network Git or shell GitHub commands such as `git clone`, `git fetch`, `git pull`, `git push`, `git ls-remote`, or `gh`. Prefer GitHub and Linear connector tools for remote inspection, publishing, review replies, labels, comments, checks, and merges.
+6. When shell cleanup or destructive commands are policy-rejected, do not retry variants of the same command. Avoid `rm -rf` and `rm -f`; create fresh unique temp directories under writable roots or `/tmp` and leave disposable artifacts in place if cleanup is blocked.
 
 Work only in the provided repository copy. Do not touch any other path.
 
@@ -90,6 +93,7 @@ The agent talks to Linear via the `linear_graphql` tool injected by Symphony's a
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
+- If a shell command is rejected by policy or blocked by the sandbox, treat that command class as unavailable for the run and switch strategies instead of retrying nearby variants.
 
 ## Related skills
 
