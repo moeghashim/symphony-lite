@@ -1700,6 +1700,7 @@ function start_service():
     max_concurrent_agents: get_config_max_concurrent_agents(),
     running: {},
     claimed: set(),
+    continuation_history: {},
     retry_attempts: {},
     completed: set(),
     codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
@@ -1721,7 +1722,7 @@ function start_service():
 
 ```text
 on_tick(state):
-  state = reconcile_running_issues(state)
+  state = reconcile_tracked_issues(state)
 
   validation = validate_dispatch_config()
   if validation is not ok:
@@ -1749,28 +1750,44 @@ on_tick(state):
   return state
 ```
 
-### 16.3 Reconcile Active Runs
+### 16.3 Reconcile Tracked Issues
 
 ```text
-function reconcile_running_issues(state):
+function reconcile_tracked_issues(state):
   state = reconcile_stalled_runs(state)
 
   running_ids = keys(state.running)
-  if running_ids is empty:
+  capped_ids = keys(filter(state.continuation_history, entry => entry.capped_at != null))
+  tracked_ids = uniq(running_ids ++ capped_ids)
+
+  if tracked_ids is empty:
     return state
 
-  refreshed = tracker.fetch_issue_states_by_ids(running_ids)
+  refreshed = tracker.fetch_issue_states_by_ids(tracked_ids)
   if refreshed failed:
-    log_debug("keep workers running")
+    log_debug("keep tracked issue state")
     return state
 
   for issue in refreshed:
-    if issue.state in terminal_states:
+    if issue.id in running_ids and issue.state in terminal_states:
+      state = delete_continuation_history(state, issue.id)
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states:
+    else if issue.id in running_ids and issue.state in active_states:
       state.running[issue.id].issue = issue
-    else:
+    else if issue.id in running_ids:
+      state = reset_state_interval(state, issue.id, issue.state)
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
+    else if issue.id in capped_ids and issue.state in terminal_states:
+      state = delete_continuation_history(state, issue.id)
+    else if issue.id in capped_ids and issue.state changed from continuation_history[issue.id].last_known_state:
+      state = reset_state_interval(state, issue.id, issue.state)
+
+  for missing_running_id in running_ids not returned by refreshed:
+    state = delete_continuation_history(state, missing_running_id)
+    state = terminate_running_issue(state, missing_running_id, cleanup_workspace=false)
+
+  for missing_capped_id in capped_ids not returned by refreshed:
+    state = delete_continuation_history(state, missing_capped_id)
 
   return state
 ```
@@ -1779,6 +1796,9 @@ function reconcile_running_issues(state):
 
 ```text
 function dispatch_issue(issue, state, attempt):
+  if continuation_history[issue.id].last_known_state changed from issue.state:
+    state = reset_state_interval(state, issue.id, issue.state)
+
   worker = spawn_worker(
     fn -> run_agent_attempt(issue, attempt, parent_orchestrator_pid) end
   )
@@ -1788,6 +1808,11 @@ function dispatch_issue(issue, state, attempt):
       identifier: issue.identifier,
       error: "failed to spawn agent"
     })
+
+  state.continuation_history[issue.id] = advance_continuation_history(
+    continuation_history[issue.id],
+    issue.state
+  )
 
   state.running[issue.id] = {
     worker_handle,

@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      continuation_history: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -126,22 +127,13 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
+        state = record_session_completion_totals(state, running_entry, reason)
         session_id = running_entry_session_id(running_entry)
 
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_issue_completion(state, issue_id, running_entry, session_id)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -222,7 +214,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state = reconcile_tracked_issues(state)
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -272,25 +264,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp reconcile_running_issues(%State{} = state) do
+  defp reconcile_tracked_issues(%State{} = state) do
     state = reconcile_stalled_running_issues(state)
     running_ids = Map.keys(state.running)
+    capped_ids = capped_issue_ids(state.continuation_history)
+    tracked_ids = Enum.uniq(running_ids ++ capped_ids)
 
-    if running_ids == [] do
+    if tracked_ids == [] do
       state
     else
-      case Tracker.fetch_issue_states_by_ids(running_ids) do
+      case Tracker.fetch_issue_states_by_ids(tracked_ids) do
         {:ok, issues} ->
-          issues
-          |> reconcile_running_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
+          state =
+            reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+
+          state
           |> reconcile_missing_running_issue_ids(running_ids, issues)
+          |> reconcile_capped_issue_states(issues, capped_ids)
 
         {:error, reason} ->
-          Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
+          Logger.debug("Failed to refresh tracked issue states: #{inspect(reason)}; keeping current orchestrator state")
 
           state
       end
@@ -349,12 +342,16 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state
+        |> delete_continuation_history(issue.id)
+        |> terminate_running_issue(issue.id, true)
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        state
+        |> delete_continuation_history(issue.id)
+        |> terminate_running_issue(issue.id, false)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -362,7 +359,9 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        state
+        |> reset_state_interval(issue.id, issue.state)
+        |> terminate_running_issue(issue.id, false)
     end
   end
 
@@ -383,7 +382,10 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+
+        state_acc
+        |> delete_continuation_history(issue_id)
+        |> terminate_running_issue(issue_id, false)
       end
     end)
   end
@@ -401,6 +403,57 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp log_missing_running_issue(_state, _issue_id), do: :ok
+
+  defp reconcile_capped_issue_states(%State{} = state, issues, capped_ids)
+       when is_list(issues) and is_list(capped_ids) do
+    issue_map =
+      Map.new(issues, fn
+        %Issue{id: issue_id} = issue when is_binary(issue_id) -> {issue_id, issue}
+      end)
+
+    running_ids = state.running |> Map.keys() |> MapSet.new()
+    terminal_states = terminal_state_set()
+
+    Enum.reduce(capped_ids, state, fn issue_id, state_acc ->
+      cond do
+        MapSet.member?(running_ids, issue_id) ->
+          state_acc
+
+        not capped_issue?(Map.get(state_acc.continuation_history, issue_id)) ->
+          state_acc
+
+        true ->
+          reconcile_capped_issue_state(
+            state_acc,
+            issue_id,
+            Map.get(issue_map, issue_id),
+            terminal_states
+          )
+      end
+    end)
+  end
+
+  defp reconcile_capped_issue_states(state, _issues, _capped_ids), do: state
+
+  defp reconcile_capped_issue_state(%State{} = state, issue_id, nil, _terminal_states) do
+    delete_continuation_history(state, issue_id)
+  end
+
+  defp reconcile_capped_issue_state(%State{} = state, issue_id, %Issue{} = issue, terminal_states) do
+    cond do
+      terminal_issue_state?(issue.state, terminal_states) ->
+        delete_continuation_history(state, issue_id)
+
+      !issue_routable_to_worker?(issue) ->
+        delete_continuation_history(state, issue_id)
+
+      continuation_state_changed?(state, issue_id, issue.state) ->
+        reset_state_interval(state, issue_id, issue.state)
+
+      true ->
+        state
+    end
+  end
 
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
@@ -559,6 +612,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !capped_for_current_state?(issue, state.continuation_history) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -660,7 +714,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        state
+        |> maybe_reset_state_interval(refreshed_issue)
+        |> do_dispatch_issue(refreshed_issue, attempt, preferred_worker_host)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -699,36 +755,42 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
-        running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
-          })
-
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+        running_entry = %{
+          pid: pid,
+          ref: ref,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: worker_host,
+          workspace_path: nil,
+          session_id: nil,
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0,
+          retry_attempt: normalize_retry_attempt(attempt),
+          started_at: DateTime.utc_now()
         }
+
+        running =
+          Map.put(state.running, issue.id, running_entry)
+
+        state
+        |> track_issue_session(issue)
+        |> then(fn updated_state ->
+          %{
+            updated_state
+            | running: running,
+              claimed: MapSet.put(state.claimed, issue.id),
+              retry_attempts: Map.delete(state.retry_attempts, issue.id)
+          }
+        end)
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -854,21 +916,39 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
+
+        {:noreply,
+         state
+         |> delete_continuation_history(issue_id)
+         |> release_issue_claim(issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
+        state =
+          if continuation_state_changed?(state, issue_id, issue.state) do
+            reset_state_interval(state, issue_id, issue.state)
+          else
+            state
+          end
+
         handle_active_retry(state, issue, attempt, metadata)
 
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
 
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply,
+         state
+         |> reset_state_interval(issue_id, issue.state)
+         |> release_issue_claim(issue_id)}
     end
   end
 
   defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
-    {:noreply, release_issue_claim(state, issue_id)}
+
+    {:noreply,
+     state
+     |> delete_continuation_history(issue_id)
+     |> release_issue_claim(issue_id)}
   end
 
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
@@ -926,10 +1006,28 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    case metadata[:delay_type] do
+      :continuation ->
+        continuation_retry_delay(metadata[:issue_state], metadata[:interval_session_count])
+
+      _ ->
+        failure_retry_delay(attempt)
+    end
+  end
+
+  defp continuation_retry_delay(state_name, interval_session_count) do
+    normalized_state = normalize_issue_state(state_name || "")
+
+    case {normalized_state, interval_session_count} do
+      {"merging", 1} -> 30_000
+      {"merging", 2} -> 120_000
+      {"merging", 3} -> 300_000
+      {"merging", count} when is_integer(count) and count >= 4 -> 600_000
+      {_, 1} -> 5_000
+      {_, 2} -> 30_000
+      {_, 3} -> 120_000
+      {_, count} when is_integer(count) and count >= 4 -> 300_000
+      _ -> @continuation_retry_delay_ms
     end
   end
 
@@ -1274,8 +1372,11 @@ defmodule SymphonyElixir.Orchestrator do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
 
-  defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
+  defp record_session_completion_totals(state, running_entry, exit_reason \\ :unknown)
+
+  defp record_session_completion_totals(state, running_entry, exit_reason) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
+    state = log_session_completion(state, running_entry, runtime_seconds, exit_reason)
 
     codex_totals =
       apply_token_delta(
@@ -1291,7 +1392,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | codex_totals: codex_totals}
   end
 
-  defp record_session_completion_totals(state, _running_entry), do: state
+  defp record_session_completion_totals(state, _running_entry, _exit_reason), do: state
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
@@ -1311,6 +1412,267 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)
   end
+
+  defp handle_normal_issue_completion(state, issue_id, running_entry, session_id) do
+    issue = Map.get(running_entry, :issue)
+    interval_session_count = current_interval_session_count(state, issue_id)
+    max_sessions = Config.settings!().agent.max_sessions_per_state_interval
+
+    state = complete_issue(state, issue_id)
+
+    cond do
+      not is_map(issue) ->
+        state
+
+      max_sessions == 0 or interval_session_count >= max_sessions ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; session budget exhausted")
+
+        state
+        |> mark_issue_capped(issue_id, running_entry)
+        |> release_issue_claim(issue_id)
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        schedule_issue_retry(state, issue_id, 1, %{
+          identifier: running_entry.identifier,
+          delay_type: :continuation,
+          issue_state: issue.state,
+          interval_session_count: interval_session_count,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+    end
+  end
+
+  defp track_issue_session(%State{} = state, %Issue{id: issue_id, state: state_name})
+       when is_binary(issue_id) and is_binary(state_name) do
+    updated_entry =
+      state.continuation_history
+      |> Map.get(issue_id)
+      |> advance_continuation_history(state_name)
+
+    put_continuation_history(state, issue_id, updated_entry)
+  end
+
+  defp track_issue_session(state, _issue), do: state
+
+  defp advance_continuation_history(nil, state_name) when is_binary(state_name) do
+    %{
+      interval_session_count: 1,
+      lifecycle_session_count: 1,
+      last_known_state: state_name,
+      state_epoch: 0,
+      lifecycle_cap_hit_count: 0,
+      capped_at: nil
+    }
+  end
+
+  defp advance_continuation_history(entry, state_name) when is_map(entry) and is_binary(state_name) do
+    current_state = normalize_issue_state(state_name)
+    previous_state = normalize_issue_state(Map.get(entry, :last_known_state, ""))
+
+    cond do
+      previous_state == "" ->
+        entry
+        |> Map.put(:interval_session_count, 1)
+        |> Map.update(:lifecycle_session_count, 1, &(&1 + 1))
+        |> Map.put(:last_known_state, state_name)
+        |> Map.put(:capped_at, nil)
+
+      previous_state != current_state ->
+        entry
+        |> Map.put(:interval_session_count, 1)
+        |> Map.update(:lifecycle_session_count, 1, &(&1 + 1))
+        |> Map.put(:last_known_state, state_name)
+        |> Map.update(:state_epoch, 0, &(&1 + 1))
+        |> Map.put(:capped_at, nil)
+
+      true ->
+        entry
+        |> Map.update(:interval_session_count, 1, &(&1 + 1))
+        |> Map.update(:lifecycle_session_count, 1, &(&1 + 1))
+        |> Map.put(:last_known_state, state_name)
+    end
+  end
+
+  defp advance_continuation_history(entry, _state_name), do: entry
+
+  defp mark_issue_capped(%State{} = state, issue_id, running_entry) when is_binary(issue_id) do
+    updated_state =
+      update_continuation_history(state, issue_id, fn entry ->
+        entry
+        |> Map.update(:lifecycle_cap_hit_count, 1, &(&1 + 1))
+        |> Map.put(:capped_at, DateTime.utc_now())
+      end)
+
+    log_cap_hit(updated_state, issue_id, running_entry)
+    updated_state
+  end
+
+  defp current_interval_session_count(%State{} = state, issue_id) when is_binary(issue_id) do
+    state.continuation_history
+    |> Map.get(issue_id, %{})
+    |> Map.get(:interval_session_count, 0)
+  end
+
+  defp current_interval_session_count(_state, _issue_id), do: 0
+
+  defp maybe_reset_state_interval(%State{} = state, %Issue{id: issue_id, state: state_name})
+       when is_binary(issue_id) and is_binary(state_name) do
+    if continuation_state_changed?(state, issue_id, state_name) do
+      reset_state_interval(state, issue_id, state_name)
+    else
+      state
+    end
+  end
+
+  defp maybe_reset_state_interval(state, _issue), do: state
+
+  defp continuation_state_changed?(%State{} = state, issue_id, state_name)
+       when is_binary(issue_id) and is_binary(state_name) do
+    case Map.get(state.continuation_history, issue_id) do
+      %{last_known_state: last_known_state} when is_binary(last_known_state) ->
+        normalize_issue_state(last_known_state) != normalize_issue_state(state_name)
+
+      _ ->
+        false
+    end
+  end
+
+  defp continuation_state_changed?(_state, _issue_id, _state_name), do: false
+
+  defp reset_state_interval(%State{} = state, issue_id, state_name)
+       when is_binary(issue_id) and is_binary(state_name) do
+    update_continuation_history(state, issue_id, fn
+      nil ->
+        %{
+          interval_session_count: 0,
+          lifecycle_session_count: 0,
+          last_known_state: state_name,
+          state_epoch: 0,
+          lifecycle_cap_hit_count: 0,
+          capped_at: nil
+        }
+
+      entry ->
+        entry
+        |> Map.put(:interval_session_count, 0)
+        |> Map.put(:capped_at, nil)
+        |> Map.put(:last_known_state, state_name)
+        |> Map.update(:state_epoch, 0, &(&1 + 1))
+    end)
+  end
+
+  defp reset_state_interval(state, _issue_id, _state_name), do: state
+
+  defp delete_continuation_history(%State{} = state, issue_id) when is_binary(issue_id) do
+    %{state | continuation_history: Map.delete(state.continuation_history, issue_id)}
+  end
+
+  defp delete_continuation_history(state, _issue_id), do: state
+
+  defp put_continuation_history(%State{} = state, issue_id, entry)
+       when is_binary(issue_id) and is_map(entry) do
+    %{state | continuation_history: Map.put(state.continuation_history, issue_id, entry)}
+  end
+
+  defp update_continuation_history(%State{} = state, issue_id, fun)
+       when is_binary(issue_id) and is_function(fun, 1) do
+    updated_entry = fun.(Map.get(state.continuation_history, issue_id))
+
+    if is_map(updated_entry) do
+      put_continuation_history(state, issue_id, updated_entry)
+    else
+      delete_continuation_history(state, issue_id)
+    end
+  end
+
+  defp capped_issue_ids(history) when is_map(history) do
+    history
+    |> Enum.filter(fn {_issue_id, entry} -> capped_issue?(entry) end)
+    |> Enum.map(fn {issue_id, _entry} -> issue_id end)
+  end
+
+  defp capped_issue_ids(_history), do: []
+
+  defp capped_for_current_state?(%Issue{id: issue_id, state: state_name}, history)
+       when is_binary(issue_id) and is_binary(state_name) and is_map(history) do
+    case Map.get(history, issue_id) do
+      %{capped_at: %DateTime{}, last_known_state: last_known_state} when is_binary(last_known_state) ->
+        normalize_issue_state(last_known_state) == normalize_issue_state(state_name)
+
+      _ ->
+        false
+    end
+  end
+
+  defp capped_for_current_state?(_issue, _history), do: false
+
+  defp capped_issue?(%{capped_at: %DateTime{}}), do: true
+  defp capped_issue?(_entry), do: false
+
+  defp log_session_completion(%State{} = state, running_entry, runtime_seconds, exit_reason)
+       when is_map(running_entry) do
+    issue = Map.get(running_entry, :issue, %{})
+    issue_id = Map.get(issue, :id)
+    history_entry = if is_binary(issue_id), do: Map.get(state.continuation_history, issue_id), else: nil
+    cap_hit = session_exit_hits_cap?(issue, history_entry, exit_reason)
+
+    Logger.info(
+      "session completed" <>
+        " issue_id=#{issue_id || "n/a"}" <>
+        " issue_identifier=#{Map.get(running_entry, :identifier, "n/a")}" <>
+        " session_id=#{running_entry_session_id(running_entry)}" <>
+        " interval_session_count=#{Map.get(history_entry || %{}, :interval_session_count, 0)}" <>
+        " lifecycle_session_count=#{Map.get(history_entry || %{}, :lifecycle_session_count, 0)}" <>
+        " state=#{inspect(Map.get(issue, :state))}" <>
+        " state_epoch=#{Map.get(history_entry || %{}, :state_epoch, 0)}" <>
+        " cap_hit=#{if(cap_hit, do: "true", else: "false")}" <>
+        " input_tokens=#{Map.get(running_entry, :codex_input_tokens, 0)}" <>
+        " output_tokens=#{Map.get(running_entry, :codex_output_tokens, 0)}" <>
+        " total_tokens=#{Map.get(running_entry, :codex_total_tokens, 0)}" <>
+        " runtime_seconds=#{format_runtime_seconds_for_log(runtime_seconds)}" <>
+        " exit_reason=#{inspect(exit_reason)}"
+    )
+
+    state
+  end
+
+  defp log_cap_hit(%State{} = state, issue_id, running_entry) when is_binary(issue_id) and is_map(running_entry) do
+    history_entry = Map.get(state.continuation_history, issue_id, %{})
+    issue_state = running_entry |> Map.get(:issue, %{}) |> Map.get(:state)
+
+    Logger.info(
+      "session budget exhausted" <>
+        " issue_id=#{issue_id}" <>
+        " issue_identifier=#{Map.get(running_entry, :identifier, "n/a")}" <>
+        " state=#{inspect(issue_state)}" <>
+        " state_epoch=#{Map.get(history_entry, :state_epoch, 0)}" <>
+        " sessions=#{Map.get(history_entry, :interval_session_count, 0)}" <>
+        " lifecycle_cap_hit_count=#{Map.get(history_entry, :lifecycle_cap_hit_count, 0)}" <>
+        " hard_stop_until_state_change=true"
+    )
+  end
+
+  defp session_exit_hits_cap?(%Issue{state: state_name}, history_entry, :normal)
+       when is_binary(state_name) and is_map(history_entry) do
+    max_sessions = Config.settings!().agent.max_sessions_per_state_interval
+    interval_session_count = Map.get(history_entry, :interval_session_count, 0)
+
+    active_issue_state?(state_name, active_state_set()) and
+      (max_sessions == 0 or interval_session_count >= max_sessions)
+  end
+
+  defp session_exit_hits_cap?(_issue, _history_entry, _exit_reason), do: false
+
+  defp format_runtime_seconds_for_log(runtime_seconds) when is_float(runtime_seconds),
+    do: Float.round(runtime_seconds, 3)
+
+  defp format_runtime_seconds_for_log(runtime_seconds) when is_integer(runtime_seconds),
+    do: runtime_seconds
+
+  defp format_runtime_seconds_for_log(_runtime_seconds), do: 0
 
   defp apply_codex_token_delta(
          %{codex_totals: codex_totals} = state,
@@ -1414,9 +1776,7 @@ defmodule SymphonyElixir.Orchestrator do
       update
     ]
 
-    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
-      Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
-      %{}
+    Enum.find_value(payloads, &absolute_token_usage_from_payload/1) || %{}
   end
 
   defp extract_rate_limits(update) do
@@ -1444,22 +1804,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp absolute_token_usage_from_payload(_payload), do: nil
-
-  defp turn_completed_usage_from_payload(payload) when is_map(payload) do
-    method = Map.get(payload, "method") || Map.get(payload, :method)
-
-    if method in ["turn/completed", :turn_completed] do
-      direct =
-        Map.get(payload, "usage") ||
-          Map.get(payload, :usage) ||
-          map_at_path(payload, ["params", "usage"]) ||
-          map_at_path(payload, [:params, :usage])
-
-      if is_map(direct) and integer_token_map?(direct), do: direct
-    end
-  end
-
-  defp turn_completed_usage_from_payload(_payload), do: nil
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
     direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)

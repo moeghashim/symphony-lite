@@ -17,6 +17,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_sessions_per_state_interval == 5
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +37,13 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_sessions_per_state_interval: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_sessions_per_state_interval"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_sessions_per_state_interval: 3)
+    assert Config.settings!().agent.max_sessions_per_state_interval == 3
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -514,10 +522,11 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
-  test "normal worker exit schedules active-state continuation retry" do
+  test "normal worker exit schedules active-state continuation retry while under session budget" do
     issue_id = "issue-resume"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
+    write_workflow_file!(Workflow.workflow_file_path(), max_sessions_per_state_interval: 5)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
     on_exit(fn ->
@@ -540,6 +549,16 @@ defmodule SymphonyElixir.CoreTest do
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
       |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:continuation_history, %{
+        issue_id => %{
+          interval_session_count: 1,
+          lifecycle_session_count: 1,
+          last_known_state: "In Progress",
+          state_epoch: 0,
+          lifecycle_cap_hit_count: 0,
+          capped_at: nil
+        }
+      })
       |> Map.put(:retry_attempts, %{})
     end)
 
@@ -549,9 +568,238 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 4_000, 5_500)
+    assert state.continuation_history[issue_id].interval_session_count == 1
+  end
+
+  test "normal worker exit hard-caps the issue when the session budget is exhausted" do
+    issue_id = "issue-capped"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CappedContinuationOrchestrator)
+    write_workflow_file!(Workflow.workflow_file_path(), max_sessions_per_state_interval: 1)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-562",
+      issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:continuation_history, %{
+        issue_id => %{
+          interval_session_count: 1,
+          lifecycle_session_count: 1,
+          last_known_state: "In Progress",
+          state_epoch: 0,
+          lifecycle_cap_hit_count: 0,
+          capped_at: nil
+        }
+      })
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    assert %{interval_session_count: 1, lifecycle_cap_hit_count: 1, capped_at: %DateTime{}} =
+             state.continuation_history[issue_id]
+  end
+
+  test "poll dispatch skips capped issues whose tracker state has not changed" do
+    issue_id = "issue-capped-unchanged"
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 5_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-563",
+      state: "In Progress",
+      title: "Still capped",
+      description: "Should stay skipped",
+      labels: []
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CappedPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{},
+          claimed: MapSet.new(),
+          retry_attempts: %{},
+          continuation_history: %{
+            issue_id => %{
+              interval_session_count: 5,
+              lifecycle_session_count: 5,
+              last_known_state: "In Progress",
+              state_epoch: 0,
+              lifecycle_cap_hit_count: 1,
+              capped_at: DateTime.utc_now()
+            }
+          }
+      }
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+
+    assert %{capped_at: %DateTime{}, last_known_state: "In Progress"} =
+             state.continuation_history[issue_id]
+  end
+
+  test "state changes lift the cap for the next dispatch interval" do
+    issue_id = "issue-state-changed"
+
+    state = %Orchestrator.State{
+      continuation_history: %{
+        issue_id => %{
+          interval_session_count: 5,
+          lifecycle_session_count: 5,
+          last_known_state: "Todo",
+          state_epoch: 0,
+          lifecycle_cap_hit_count: 1,
+          capped_at: DateTime.utc_now()
+        }
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-564",
+      state: "In Progress",
+      title: "Ready again",
+      description: "State changed after cap",
+      labels: []
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "capped issue reconciliation clears history when the issue becomes terminal or disappears" do
+    issue_id = "issue-capped-terminal"
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 5_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    terminal_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-565",
+      state: "Done",
+      title: "Terminal while capped",
+      description: "History should be cleaned",
+      labels: []
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CappedTerminalOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | continuation_history: %{
+            issue_id => %{
+              interval_session_count: 5,
+              lifecycle_session_count: 5,
+              last_known_state: "In Progress",
+              state_epoch: 0,
+              lifecycle_cap_hit_count: 1,
+              capped_at: DateTime.utc_now()
+            }
+          }
+      }
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue])
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    refute Map.has_key?(:sys.get_state(pid).continuation_history, issue_id)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | continuation_history: %{
+            issue_id => %{
+              interval_session_count: 5,
+              lifecycle_session_count: 5,
+              last_known_state: "In Progress",
+              state_epoch: 0,
+              lifecycle_cap_hit_count: 1,
+              capped_at: DateTime.utc_now()
+            }
+          }
+      }
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    send(pid, :run_poll_cycle)
+    Process.sleep(50)
+    refute Map.has_key?(:sys.get_state(pid).continuation_history, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

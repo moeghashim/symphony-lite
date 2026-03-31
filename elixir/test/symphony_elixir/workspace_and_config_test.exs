@@ -814,6 +814,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_concurrent_agents"
 
+    write_workflow_file!(Workflow.workflow_file_path(), max_sessions_per_state_interval: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_sessions_per_state_interval"
+
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "worker.max_concurrent_agents_per_host"
@@ -835,6 +839,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},
       workspace_root: 123,
+      max_sessions_per_state_interval: -1,
       max_retry_backoff_ms: 0,
       max_concurrent_agents_by_state: %{"Todo" => "1", "Review" => 0, "Done" => "bad"},
       hook_timeout_ms: 0,

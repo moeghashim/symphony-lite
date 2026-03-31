@@ -135,6 +135,7 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_sessions_per_state_interval: 5
 codex:
   command: codex app-server
 ---
@@ -161,6 +162,10 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.max_sessions_per_state_interval` caps how many total agent sessions Symphony will run while
+  an issue stays in the same tracker state. Default: `5`. A value of `0` disables continuation
+  retries entirely, and capped issues stay ineligible for poll-based redispatch until their state
+  changes, becomes terminal, or disappears from the tracker.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
