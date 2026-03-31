@@ -39,9 +39,10 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
    - The `linear` skill also uses `sync_workpad` for file-backed workpad updates.
-5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
+5. Set `LINEAR_PROJECT_SLUG` for the Linear project Symphony should poll.
+   - To get the slug, right-click the project and copy its URL. The slug is part of the URL.
+   - The checked-in `WORKFLOW.md` now reads `tracker.project_slug` from `LINEAR_PROJECT_SLUG`, so
+     you do not need to hardcode project-specific values into the workflow file.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
@@ -126,7 +127,7 @@ Minimal example:
 ---
 tracker:
   kind: linear
-  project_slug: "..."
+  project_slug: $LINEAR_PROJECT_SLUG
 workspace:
   root: ~/code/workspaces
 hooks:
@@ -181,6 +182,7 @@ Notes:
 ```yaml
 tracker:
   api_key: $LINEAR_API_KEY
+  project_slug: $LINEAR_PROJECT_SLUG
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
