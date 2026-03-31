@@ -39,10 +39,8 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
    - The `linear` skill also uses `sync_workpad` for file-backed workpad updates.
-5. Set `LINEAR_PROJECT_SLUG` for the Linear project Symphony should poll.
-   - To get the slug, right-click the project and copy its URL. The slug is part of the URL.
-   - The checked-in `WORKFLOW.md` now reads `tracker.project_slug` from `LINEAR_PROJECT_SLUG`, so
-     you do not need to hardcode project-specific values into the workflow file.
+5. The checked-in `WORKFLOW.md` is configured to poll the Linear project slug `symphony-lite`.
+   - If you need a different project later, update `tracker.project_slug` in the workflow file.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
@@ -77,16 +75,14 @@ Recommended deployment inputs:
 
 - Add a Railway volume mounted at `/data`
 - Set `LINEAR_API_KEY`
-- Set `LINEAR_PROJECT_SLUG`
 - Set `OPENAI_API_KEY`
 - Set `SOURCE_REPO_URL` to the GitHub repo Symphony should clone for each issue
 - If `SOURCE_REPO_URL` is private, set `GITHUB_TOKEN` to a fine-grained GitHub token with read-only access to that repository
-- Use [`WORKFLOW.railway.md`](./WORKFLOW.railway.md) as-is; it reads `LINEAR_PROJECT_SLUG` from the environment
+- Use [`WORKFLOW.railway.md`](./WORKFLOW.railway.md) as-is; it is preconfigured for the `symphony-lite` Linear project
 
 The container entrypoint will:
 
 - fail closed if `LINEAR_API_KEY` is missing
-- read the Linear project slug from `LINEAR_PROJECT_SLUG`
 - log Codex in from `OPENAI_API_KEY` if the container is not already authenticated
 - transparently rewrite `https://github.com/...` clone URLs when `GITHUB_TOKEN` is set, so private repos can be cloned without committing credentials into the workflow
 - start Symphony on Railway's injected `PORT`
