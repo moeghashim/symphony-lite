@@ -22,7 +22,13 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          ensure_core_runtime_running: 0,
+          stop_default_http_server: 0
+        ]
 
       setup do
         workflow_root =
@@ -36,6 +42,7 @@ defmodule SymphonyElixir.TestSupport do
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+        ensure_core_runtime_running()
         stop_default_http_server()
 
         on_exit(fn ->
@@ -69,22 +76,74 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 
+  def ensure_core_runtime_running do
+    ensure_supervisor_running()
+    ensure_supervisor_child_running(SymphonyElixir.PubSub, [SymphonyElixir.PubSub, Phoenix.PubSub.Supervisor])
+    ensure_supervisor_child_running(SymphonyElixir.WorkflowStore, [SymphonyElixir.WorkflowStore])
+    ensure_supervisor_child_running(SymphonyElixir.Orchestrator, [SymphonyElixir.Orchestrator])
+    ensure_supervisor_child_running(SymphonyElixir.StatusDashboard, [SymphonyElixir.StatusDashboard])
+    :ok
+  end
+
   def stop_default_http_server do
-    case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
-           {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
-           _child -> false
-         end) do
-      {SymphonyElixir.HttpServer, pid, _type, _modules} when is_pid(pid) ->
-        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.HttpServer)
+    case Process.whereis(SymphonyElixir.Supervisor) do
+      pid when is_pid(pid) ->
+        case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
+               {SymphonyElixir.HttpServer, _child_pid, _type, _modules} -> true
+               _child -> false
+             end) do
+          {SymphonyElixir.HttpServer, child_pid, _type, _modules} when is_pid(child_pid) ->
+            :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.HttpServer)
 
-        if Process.alive?(pid) do
-          Process.exit(pid, :normal)
+            if Process.alive?(child_pid) do
+              Process.exit(child_pid, :normal)
+            end
+
+            :ok
+
+          _ ->
+            :ok
         end
-
-        :ok
 
       _ ->
         :ok
+    end
+  end
+
+  defp ensure_supervisor_running do
+    case Process.whereis(SymphonyElixir.Supervisor) do
+      pid when is_pid(pid) ->
+        :ok
+
+      _ ->
+        case Application.ensure_all_started(:symphony_elixir) do
+          {:ok, _apps} -> :ok
+          {:error, {:already_started, _app}} -> :ok
+          {:error, reason} -> raise "failed to start symphony_elixir test runtime: #{inspect(reason)}"
+        end
+    end
+  end
+
+  defp ensure_supervisor_child_running(process_name, child_ids) when is_list(child_ids) do
+    case Process.whereis(process_name) do
+      pid when is_pid(pid) ->
+        :ok
+
+      _ ->
+        Enum.find_value(child_ids, fn child_id ->
+          case Supervisor.restart_child(SymphonyElixir.Supervisor, child_id) do
+            {:ok, _pid} -> true
+            {:error, {:already_started, _pid}} -> true
+            {:error, :running} -> true
+            {:error, :not_found} -> false
+            _other -> false
+          end
+        end)
+
+        case Process.whereis(process_name) do
+          pid when is_pid(pid) -> :ok
+          _ -> raise "failed to restore supervised test dependency #{inspect(process_name)}"
+        end
     end
   end
 
